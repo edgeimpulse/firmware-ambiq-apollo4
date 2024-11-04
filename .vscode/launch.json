@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Ambiq Apollo4 Debug (Cortex-Debug)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceRoot}/build/apollo4p_blue_kxr_evb/arm-none-eabi/firmware-ambiq-apollo4.axf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "jlink",
+            "showDevDebugOutput": "parsed",
+            "device": "AMAP42KK-KBR",
+            "interface": "swd",
+            "svdFile": "${workspaceRoot}/pack/svd/board.svd",
+            "preLaunchCommands": [
+                "monitor speed 15000"
+            ],            
+        }    
+    ],
+}

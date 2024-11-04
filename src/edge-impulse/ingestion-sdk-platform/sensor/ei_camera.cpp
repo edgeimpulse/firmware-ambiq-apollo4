@@ -1,0 +1,374 @@
+/*
+ * Copyright (c) 2024 EdgeImpulse Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#include "ei_camera.h"
+#include "edge-impulse-sdk/porting/ei_classifier_porting.h"
+#include "edge-impulse-sdk/third_party/flatbuffers/include/flatbuffers/flexbuffers.h"
+#include "ns_core.h"
+#include "ns_camera.h"
+#include "ArducamCamera.h"
+
+extern ArducamCamera camera; // Arducam driver assumes this is a global, so :shrug:
+
+void picture_dma_complete(ns_camera_config_t *cfg);
+void picture_taken_complete(ns_camera_config_t *cfg);
+static bool RBG565ToRGB888(uint8_t *src_buf, uint8_t *dst_buf, uint32_t src_len);
+
+ei_device_snapshot_resolutions_t EiAmbiqCamera::resolutions[] = {
+        {96, 96},
+        {128, 128},
+        {160, 160},
+    };
+
+#define JPG_MODE
+
+#if defined (JPG_MODE)
+AM_SHARED_RW static uint8_t jpgBuffer[JPG_BUFF_SIZE] __attribute__((aligned(16)));
+static uint32_t start_jpg_dma(void);
+static void press_jpg_shutter_button(uint8_t img_modex_index);
+#else
+static void press_rgb_shutter_button(uint8_t img_modex_index);
+static uint32_t start_rgb_dma(void);
+#endif
+
+AM_SHARED_RW static uint8_t rgbBuffer[RGB_BUFF_SIZE] __attribute__((aligned(16)));
+AM_SHARED_RW static uint8_t snapshot_buffer[RGB888_BUFF_SIZE] __attribute__((aligned(16)));
+
+static uint32_t bufferOffset = 0;
+
+volatile bool dmaComplete = false; // ISR-land
+volatile bool pictureTaken = false;
+volatile uint32_t buffer_length = 0;
+
+ns_camera_config_t camera_config = {
+    .api = &ns_camera_V1_0_0,
+    .spiSpeed = CAM_SPI_SPEED,
+    .cameraHw = NS_ARDUCAM,
+#ifdef JPG_MODE
+    .imageMode = NS_CAM_IMAGE_MODE_320X320,
+    .imagePixFmt = NS_CAM_IMAGE_PIX_FMT_JPEG,
+#else
+    .imageMode = NS_CAM_IMAGE_MODE_96X96,
+    .imagePixFmt = NS_CAM_IMAGE_PIX_FMT_RGB565,
+#endif
+    .spiConfig = {.iom = CAM_SPI_IOM}, // Only IOM1 is currently supported
+    .dmaCompleteCb = picture_dma_complete,
+    .pictureTakenCb = picture_taken_complete,
+};
+
+EiAmbiqCamera::EiAmbiqCamera() :
+    camera_found(false),
+    tried_init(false),
+    width(96),
+    height(96)
+{
+}
+
+/**
+ * @brief 
+ * 
+ * @param width 
+ * @param height 
+ * @return true 
+ * @return false 
+ */
+bool EiAmbiqCamera::init(uint16_t width, uint16_t height)
+{
+    if (tried_init == true && camera_found == true) {
+        this->width = width;
+        this->height = height;
+
+        if (this->width == 96 && this->height == 96) {
+            this->img_mode_index = 0;
+        } else if (this->width == 128 && this->height == 128) {
+            this->img_mode_index = 1;
+        } else if (this->width == 160 && this->height == 160) {
+            this->img_mode_index = 2;
+        } else {
+            ei_printf("Unsupported resolution %dx%d\n", this->width, this->height);
+            return false;
+        }
+
+        return camera_found;
+    }
+    tried_init = true;
+
+    if (ns_camera_init(&camera_config) != 0) {
+        ei_printf("Failed to init camera\r\n");
+        return false;
+    }
+
+    camera_found = true;
+    
+    ei_printf("Camera Init Success\n");
+    ns_stop_camera(&camera_config);
+
+    camera_found = true;
+
+    this->width = width;
+    this->height = height;
+
+    ns_start_camera(&camera_config);
+    setBrightness(&camera, CAM_BRIGHTNESS_LEVEL_DEFAULT);
+    setEV(&camera, CAM_EV_LEVEL_DEFAULT);
+    setContrast(&camera, CAM_CONTRAST_LEVEL_DEFAULT);
+    setAutoExposure(&camera, true); 
+    ns_delay_us(100000);
+
+    return true;
+}
+
+/**
+ * @brief 
+ * 
+ * @return true 
+ * @return false 
+ */
+bool EiAmbiqCamera::deinit(void)
+{
+    return true;
+}
+
+/**
+ * @brief 
+ * 
+ * @param res 
+ * @param res_num 
+ */
+void EiAmbiqCamera::get_resolutions(ei_device_snapshot_resolutions_t **res, uint8_t *res_num)
+{
+    *res = &EiAmbiqCamera::resolutions[0];
+    *res_num = sizeof(EiAmbiqCamera::resolutions) / sizeof(ei_device_snapshot_resolutions_t);
+}
+
+/**
+ * @brief 
+ * 
+ * @param res 
+ * @return true 
+ * @return false 
+ */
+bool EiAmbiqCamera::set_resolution(const ei_device_snapshot_resolutions_t res)
+{
+    this->width = res.width;
+    this->height = res.height;
+
+    return true;
+}
+
+bool EiAmbiqCamera::ei_camera_capture_rgb888_packed_big_endian(
+    uint8_t *image,
+    uint32_t image_size)
+{
+    pictureTaken = false;
+    dmaComplete = false;
+
+    memset(image, 0, image_size);
+    memset(rgbBuffer, 0, RGB_BUFF_SIZE);
+#ifdef JPG_MODE
+    memset(jpgBuffer, 0, JPG_BUFF_SIZE);
+
+    press_jpg_shutter_button(this->img_mode_index);
+
+    do {
+        __WFI();
+    } while (!pictureTaken);
+
+    buffer_length = start_jpg_dma();
+
+    do {
+        __WFI();
+    } while (!dmaComplete);
+
+    buffer_length = ns_chop_off_trailing_zeros(jpgBuffer, buffer_length);
+
+    uint32_t scaling_factor[] = {3, 2, 2};
+
+    camera_decode_image(jpgBuffer, buffer_length, rgbBuffer, this->width, this->height, scaling_factor[this->img_mode_index]);
+#else
+    pictureTaken = false;
+    press_rgb_shutter_button(this->img_mode_index);
+
+    do {
+        __WFI();
+    } while (!pictureTaken);
+
+    buffer_length = start_rgb_dma();
+    do {
+        __WFI();
+    } while (!dmaComplete);
+
+#endif
+
+    RBG565ToRGB888(rgbBuffer, image, (this->width * this->height * 2));
+
+    return true;
+}
+
+bool EiAmbiqCamera::get_fb_ptr(uint8_t** fb_ptr)
+{
+    *fb_ptr = snapshot_buffer;
+    return true;
+}
+
+/**
+ * @brief 
+ * 
+ * @return ei_device_snapshot_resolutions_t 
+ */
+ei_device_snapshot_resolutions_t EiAmbiqCamera::get_min_resolution(void)
+{
+    return EiAmbiqCamera::resolutions[0];
+}
+
+/**
+ * @brief 
+ * 
+ * @param required_width 
+ * @param required_height 
+ * @return ei_device_snapshot_resolutions_t 
+ */
+ei_device_snapshot_resolutions_t EiAmbiqCamera::search_resolution(uint32_t required_width, uint32_t required_height)
+{
+    ei_device_snapshot_resolutions_t res;
+    uint16_t max_width;
+    uint16_t max_height;
+
+    // camera_get_max_res(&max_width, &max_height);
+    max_width = 160;
+    max_height = 160;
+
+    if ((required_width <= max_width) && (required_height <= max_height)) {
+        res.height = required_height;
+        res.width = required_width;
+    }
+    else {
+        res.height = max_height;
+        res.width = max_width;
+    }
+
+    return res;
+}
+
+/**
+ *
+ * @return
+ */
+EiCamera* EiCamera::get_camera(void)
+{
+    static EiAmbiqCamera cam;
+
+    return &cam;
+}
+
+#if defined (JPG_MODE)
+
+static void press_jpg_shutter_button(uint8_t img_modex_index) 
+{
+    camera_config.imageMode = NS_CAM_IMAGE_MODE_320X320; // with jpg we take picture at 320x320 then resize when decoding
+    camera_config.imagePixFmt = NS_CAM_IMAGE_PIX_FMT_JPEG; 
+    ns_press_shutter_button(&camera_config);
+}
+/**
+ * @brief 
+ * 
+ * @param bufferId 
+ * @return uint32_t 
+ */
+static uint32_t start_jpg_dma(void)
+{
+    uint32_t camLength = 0;
+
+    camLength = ns_start_dma_read(&camera_config, jpgBuffer, &bufferOffset, JPG_BUFF_SIZE);
+
+    bufferOffset = 1;
+
+    return camLength;
+}
+
+#else
+
+const ns_image_mode_e img_modex_index_values[] = {
+    NS_CAM_IMAGE_MODE_96X96,
+    NS_CAM_IMAGE_MODE_128X128,
+    NS_CAM_IMAGE_MODE_320X320
+};
+
+static void press_rgb_shutter_button(uint8_t img_modex_index) 
+{
+    camera_config.imageMode = img_modex_index_values[img_modex_index];
+    camera_config.imagePixFmt = NS_CAM_IMAGE_PIX_FMT_RGB565;   
+    ns_press_shutter_button(&camera_config);
+}
+
+/**
+ * @brief 
+ * 
+ * @return uint32_t 
+ */
+static uint32_t start_rgb_dma(void) 
+{
+    uint32_t camLength = ns_start_dma_read(&camera_config, rgbBuffer, &bufferOffset, RGB_BUFF_SIZE);
+    return camLength;
+}
+
+#endif
+
+/**
+ * @brief 
+ * 
+ * @param cfg 
+ */
+void picture_dma_complete(ns_camera_config_t *cfg) 
+{    
+    dmaComplete = true;    
+}
+
+/**
+ * @brief 
+ * 
+ * @param cfg 
+ */
+void picture_taken_complete(ns_camera_config_t *cfg) 
+{
+    pictureTaken = true;
+}
+
+/**
+ *
+ * @param src_buf
+ * @param dst_buf
+ * @param src_len
+ * @return
+ */
+static bool RBG565ToRGB888(uint8_t *src_buf, uint8_t *dst_buf, uint32_t src_len)
+{
+    uint32_t pix_count = src_len / 2;
+    uint8_t r5, g6, b5;
+    uint16_t* psrc = (uint16_t*)src_buf;
+
+    for (uint32_t i = 0; i < pix_count; i ++, psrc++) {
+        r5 = (*psrc & 0xF800) >> 11;
+        g6 = (*psrc & 0x07E0) >> 5;
+        b5 = (*psrc & 0x001F);
+
+        *dst_buf++ = (r5 * 527 + 23) >> 6;
+        *dst_buf++ = (g6 * 259 + 33) >> 6;
+        *dst_buf++ = (b5 * 527 + 23) >> 6;
+    }
+
+    return true;
+}
