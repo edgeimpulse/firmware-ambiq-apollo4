@@ -1,3 +1,7 @@
 build/
 !.vscode/
 .DS_Store
+src/edge-impulse/edge-impulse-sdk/CMSIS/.DS_Store
+src/edge-impulse/edge-impulse-sdk/CMSIS/DSP/.DS_Store
+src/edge-impulse/edge-impulse-sdk/CMSIS/NN/.DS_Store
+src/edge-impulse/edge-impulse-sdk/porting/.DS_Store
