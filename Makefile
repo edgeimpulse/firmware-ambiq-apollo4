@@ -115,6 +115,8 @@ else ifeq ($(TOOLCHAIN),arm-none-eabi)
 LINKER_FILE := src/ns-core/$(BOARD)/$(COMPDIR)/linker_script.ld
 endif
 
+LFLAGS+= -Wl,--print-memory-usage
+
 all: $(BINDIR) $(objects) $(targets)
 
 .PHONY: clean
