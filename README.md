@@ -9,8 +9,9 @@ TODO
 
 To build the application:
 ```
-make -j
+make -j4
 ```
+Replace 4 with a number of parallel build processes suitable for your system.
 
 To clean the build:
 ```
