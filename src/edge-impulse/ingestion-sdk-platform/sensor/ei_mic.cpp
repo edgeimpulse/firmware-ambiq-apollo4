@@ -289,10 +289,8 @@ void audio_frame_callback(ns_audio_config_t *config, uint16_t bytesCollected) {
 void ei_mic_thread(void (*callback)(void *buffer, uint32_t n_bytes))
 {
     if ((callback != NULL) && g_audioRecording && g_audioReady) {
-        //
         callback(&(g_in16AudioDataBuffer[g_bufsel ^= 1][0]), AUIO_SAMPLE_BUFFER_NUMBER * 2);
         g_audioReady = false;
-        //g_bufsel ^= 1;
     }
 }
 

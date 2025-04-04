@@ -37,6 +37,7 @@
 #include "edge-impulse-sdk/dsp/ei_utils.h"
 #include "ingestion-sdk-platform/sensor/ei_mic.h"
 #include "hal/am_hal_global.h"
+#include "am_util_id.h"
 
 EiAmbiqApollo4::EiAmbiqApollo4(EiDeviceMemory* mem)
 {
@@ -65,7 +66,17 @@ EiAmbiqApollo4::EiAmbiqApollo4(EiDeviceMemory* mem)
  */
 void EiAmbiqApollo4::init_device_id(void)
 {
-    char temp[20] = {"12345"};
+    char temp[20];
+    am_util_id_t chip_id;
+
+    am_util_id_device(&chip_id);
+
+    snprintf(temp, sizeof(temp), "%02x:%02x:%02x:%02x:%02x",
+        (uint8_t)(chip_id.sMcuCtrlDevice.ui32ChipID1 & 0xFF),
+        (uint8_t)((chip_id.sMcuCtrlDevice.ui32ChipID1  >> 8) & 0xFF),
+        (uint8_t)((chip_id.sMcuCtrlDevice.ui32ChipID1  >> 16) & 0xFF),
+        (uint8_t)(chip_id.sMcuCtrlDevice.ui32ChipID0 & 0xFF),
+        (uint8_t)(chip_id.sMcuCtrlDevice.ui32ChipID0 >> 8) & 0xFF);
 
     device_id = std::string(temp);
 
